@@ -1,0 +1,155 @@
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_BME280.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ThingSpeak.h>
+
+
+#define TIME_TO_SLEEP 600
+#define uS_TO_S_FACTOR 1000000ULL
+
+
+char ssid[] = "Chanasit";
+char pass[] = "YC9AAZA4";
+unsigned long myChannelNumber = 3482307;
+const char * myWriteAPIKey = "E34OIU8JAWKY042K";
+
+
+#define BATT_ADC_PIN 34  // ขาอ่านแรงดันแบตเตอรี่ (ผ่านตัวต้านทาน 10k+10k)
+#define PMS_SET_PIN   4  // ขา SET ควบคุมเปิด-ปิด PMS5003
+#define PMS_RX       16  // RX2 (GPIO16) -> ต่อกับ TX ของ PMS5003
+#define PMS_TX       17  // TX2 (GPIO17) -> ต่อกับ RX ของ PMS5003
+
+Adafruit_BME280 bme;
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+WiFiClient client;
+
+
+bool getPMS25(HardwareSerial &pmsSerial, uint16_t &pm25_val) {
+  while (pmsSerial.available() > 64) {
+    pmsSerial.read(); // เคลียร์บัฟเฟอร์ค้าง
+  }
+
+  unsigned long start = millis();
+  while (millis() - start < 5000) { // ให้เวลาอ่านค่าสูงสุด 5 วินาที
+    if (pmsSerial.available() >= 32) {
+      if (pmsSerial.peek() == 0x42) {
+        uint8_t buf[32];
+        pmsSerial.readBytes(buf, 32);
+
+        if (buf[0] == 0x42 && buf[1] == 0x4D) {
+          uint16_t sum = 0;
+          for (int i = 0; i < 30; i++) sum += buf[i];
+          uint16_t checksum = (buf[30] << 8) | buf[31];
+
+          if (sum == checksum) {
+            pm25_val = (buf[12] << 8) | buf[13]; // ค่า PM2.5 (ug/m3)
+            return true;
+          }
+        }
+      } else {
+        pmsSerial.read();
+      }
+    }
+    delay(10);
+  }
+  return false;
+}
+
+
+float readBatteryVoltage() {
+  int raw = analogRead(BATT_ADC_PIN);
+  float vout = (raw / 4095.0) * 3.3;
+  return vout * 2.0; // คำนวณกลับตามวงจรแบ่งแรงดัน (Divider 10k/10k)
+}
+
+void setup() {
+  Serial.begin(115200);
+
+
+  pinMode(PMS_SET_PIN, OUTPUT);
+  digitalWrite(PMS_SET_PIN, HIGH); 
+
+
+  Serial2.begin(9600, SERIAL_8N1, PMS_RX, PMS_TX);
+  
+  Wire.begin(21, 22);
+
+ 
+  bool oledStatus = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  if (oledStatus) {
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Station Waking Up...");
+    display.println("Warming PMS5003...");
+    display.display();
+  }
+
+  bool bmeStatus = bme.begin(0x76);
+  if (!bmeStatus) {
+    bmeStatus = bme.begin(0x77);
+  }
+
+
+  delay(3000);
+
+
+  uint16_t pm25 = 0;
+  getPMS25(Serial2, pm25);
+
+  float temp = bmeStatus ? bme.readTemperature() : 0.0;
+  float hum = bmeStatus ? bme.readHumidity() : 0.0;
+  float press = bmeStatus ? (bme.readPressure() / 100.0F) : 0.0;
+  float vbat = readBatteryVoltage();
+
+
+  if (oledStatus) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.printf("Temp : %.1f C\n", temp);
+    display.printf("Hum  : %.1f %%\n", hum);
+    display.printf("Press: %.1f hPa\n", press);
+    display.printf("PM2.5: %d ug/m3\n", pm25);
+    display.printf("Bat  : %.2f V\n", vbat);
+    display.display();
+  }
+
+ 
+  WiFi.begin(ssid, pass);
+  int wifiRetry = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiRetry < 15) {
+    delay(500);
+    wifiRetry++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+
+    ThingSpeak.begin(client);
+    ThingSpeak.setField(1, temp);   // Field 1: Temperature
+    ThingSpeak.setField(2, hum);    // Field 2: Humidity
+    ThingSpeak.setField(3, press);  // Field 3: Pressure
+    ThingSpeak.setField(4, pm25);   // Field 4: PM2.5
+    ThingSpeak.setField(5, vbat);   // Field 5: Battery
+    ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
+  }
+
+
+  digitalWrite(PMS_SET_PIN, LOW);
+
+
+  if (oledStatus) {
+    display.ssd1306_command(SSD1306_DISPLAYOFF); 
+  }
+
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+  esp_deep_sleep_start();
+}
+
+void loop() {
+
+}
+
